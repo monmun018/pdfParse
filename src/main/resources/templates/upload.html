@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>Suica PDF Viewer</title>
+    <style>
+        :root {
+            color-scheme: light dark;
+        }
+        body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            margin: 0;
+            padding: 2rem;
+            background: #f4f5f7;
+        }
+        .card {
+            max-width: 1100px;
+            margin: 0 auto 2rem;
+            background: #fff;
+            padding: 2rem;
+            border-radius: 16px;
+            box-shadow: 0 15px 35px rgb(30 60 90 / 18%);
+        }
+        h1, h2, h3 {
+            margin-top: 0;
+        }
+        form {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+        }
+        input[type="file"] {
+            padding: 0.5rem;
+        }
+        button {
+            padding: 0.75rem 1rem;
+            font-size: 1rem;
+            border: none;
+            border-radius: 999px;
+            background: #2563eb;
+            color: #fff;
+            cursor: pointer;
+            transition: opacity 150ms;
+            width: fit-content;
+        }
+        button:disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+        .error {
+            color: #b91c1c;
+            background: #fee2e2;
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+        .metadata-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+        }
+        .metadata-grid div {
+            padding: 0.75rem;
+            border-radius: 10px;
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+        }
+        fieldset.feature-options {
+            border: 1px solid #cbd5f5;
+            padding: 1rem;
+            border-radius: 12px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem 1.5rem;
+        }
+        fieldset.feature-options legend {
+            font-weight: 600;
+            padding: 0 0.5rem;
+        }
+        .feature-option {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            min-width: 220px;
+        }
+        .table-controls {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1rem;
+            font-size: 0.95rem;
+        }
+        th, td {
+            border: 1px solid #e2e8f0;
+            padding: 0.5rem 0.75rem;
+            text-align: left;
+            vertical-align: top;
+        }
+        th {
+            background: #f8fafc;
+            font-weight: 600;
+        }
+        .checkbox-col {
+            width: 42px;
+            text-align: center;
+        }
+        .pagination {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        .pagination button {
+            border-radius: 6px;
+            background: #0f172a;
+        }
+        .hint {
+            font-size: 0.85rem;
+            color: #64748b;
+        }
+        details.raw-text-panel {
+            margin-top: 1.5rem;
+            background: #0f172a10;
+            border-radius: 12px;
+            padding: 1rem;
+            border: 1px solid #cbd5f5;
+        }
+        details.raw-text-panel summary {
+            font-weight: 600;
+            cursor: pointer;
+            outline: none;
+        }
+        .raw-text {
+            margin-top: 0.75rem;
+            background: #0f172a;
+            color: #f1f5f9;
+            padding: 1rem;
+            border-radius: 10px;
+            max-height: 320px;
+            overflow: auto;
+            white-space: pre-wrap;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 0.85rem;
+        }
+        .section-divider {
+            margin: 1.5rem 0 0.75rem;
+            font-size: 1.1rem;
+        }
+    </style>
+</head>
+<body>
+<main class="card">
+    <h1>モバイル Suica 残高ご利用明細</h1>
+    <p>Upload the PDF statement to view detected metadata, table rows, and export selected entries to CSV.</p>
+
+    <form method="post" action="/extract" enctype="multipart/form-data">
+        <label for="file">Choose Suica PDF</label>
+        <input id="file" type="file" name="file" accept="application/pdf" required/>
+        <fieldset class="feature-options">
+            <legend>Select features</legend>
+            <div class="feature-option" th:each="feature : ${availableFeatures}">
+                <input type="checkbox"
+                       name="features"
+                       th:id="${'feature-' + feature.name()}"
+                       th:value="${feature.name()}"
+                       th:checked="${selectedFeatures != null ? selectedFeatures.contains(feature) : true}"/>
+                <label th:for="${'feature-' + feature.name()}"
+                       th:text="${T(com.example.demo.domain.model.PdfFeature).toDisplayName(feature)}">Feature</label>
+            </div>
+        </fieldset>
+        <button type="submit">Parse PDF</button>
+    </form>
+
+    <div class="error" th:if="${error}" th:text="${error}"></div>
+
+    <section th:if="${result}" class="result">
+        <h2 th:text="${result.fileName()}">Uploaded statement</h2>
+        <div class="metadata-grid">
+            <div>
+                <strong>Heading</strong>
+                <div th:text="${result.metadata()?.heading()}">モバイル Ｓｕｉｃａ 残高ご利用明細</div>
+            </div>
+            <div>
+                <strong>Card</strong>
+                <div th:text="${result.metadata()?.cardNumberLine()}">JE*** **** **** 3963</div>
+            </div>
+            <div>
+                <strong>History summary</strong>
+                <div th:text="${result.metadata()?.historySummary()}">残高履歴 （101件）</div>
+            </div>
+            <div>
+                <strong>Created</strong>
+                <div th:text="${result.metadata()?.createdLine()}">2025/11/15 ...</div>
+            </div>
+            <div>
+                <strong>Total pages</strong>
+                <div th:text="${result.pageCount()}">2</div>
+            </div>
+        </div>
+
+        <section th:if="${result.documentMetadata() != null}">
+            <h3 class="section-divider">PDF Document Metadata</h3>
+            <div class="metadata-grid">
+                <div>
+                    <strong>PDF version</strong>
+                    <div th:text="${result.documentMetadata().pdfVersion()}">1.4</div>
+                </div>
+                <div>
+                    <strong>Encrypted?</strong>
+                    <div th:text="${result.documentMetadata().encrypted()} ? 'Yes' : 'No'">No</div>
+                </div>
+                <div>
+                    <strong>File size</strong>
+                    <div th:text="${result.documentMetadata().fileSizeBytes()} + ' bytes'">0 bytes</div>
+                </div>
+            </div>
+
+            <div th:if="${result.documentMetadata().infoDictionary() != null}">
+                <h4>Info Dictionary</h4>
+                <div class="metadata-grid">
+                    <div>
+                        <strong>Title</strong>
+                        <div th:text="${result.documentMetadata().infoDictionary().title()}">Title</div>
+                    </div>
+                    <div>
+                        <strong>Author</strong>
+                        <div th:text="${result.documentMetadata().infoDictionary().author()}">Author</div>
+                    </div>
+                    <div>
+                        <strong>Subject</strong>
+                        <div th:text="${result.documentMetadata().infoDictionary().subject()}">Usage</div>
+                    </div>
+                    <div>
+                        <strong>Keywords</strong>
+                        <div th:text="${result.documentMetadata().infoDictionary().keywords()}">Keywords</div>
+                    </div>
+                    <div>
+                        <strong>Creator</strong>
+                        <div th:text="${result.documentMetadata().infoDictionary().creator()}">Creator</div>
+                    </div>
+                    <div>
+                        <strong>Producer</strong>
+                        <div th:text="${result.documentMetadata().infoDictionary().producer()}">Producer</div>
+                    </div>
+                    <div>
+                        <strong>Created</strong>
+                        <div th:text="${result.documentMetadata().infoDictionary().creationDate()}">2024-01-01</div>
+                    </div>
+                    <div>
+                        <strong>Modified</strong>
+                        <div th:text="${result.documentMetadata().infoDictionary().modificationDate()}">2024-01-02</div>
+                    </div>
+                    <div>
+                        <strong>Trapped</strong>
+                        <div th:text="${result.documentMetadata().infoDictionary().trapped()}">False</div>
+                    </div>
+                </div>
+            </div>
+
+            <div th:if="${result.documentMetadata().xmpMetadata() != null}">
+                <h4>XMP Metadata</h4>
+                <div class="metadata-grid">
+                    <div>
+                        <strong>Dublin Core Title</strong>
+                        <div th:text="${result.documentMetadata().xmpMetadata().dublinCoreTitle()}">Title</div>
+                    </div>
+                    <div>
+                        <strong>Creators</strong>
+                        <div th:text="${result.documentMetadata().xmpMetadata().dublinCoreCreators()}">Creator</div>
+                    </div>
+                    <div>
+                        <strong>Dates</strong>
+                        <div th:text="${result.documentMetadata().xmpMetadata().dublinCoreDates()}">Date</div>
+                    </div>
+                    <div>
+                        <strong>Create Date</strong>
+                        <div th:text="${result.documentMetadata().xmpMetadata().createDate()}">2025-01-01</div>
+                    </div>
+                    <div>
+                        <strong>Creator Tool</strong>
+                        <div th:text="${result.documentMetadata().xmpMetadata().creatorTool()}">Tool</div>
+                    </div>
+                    <div>
+                        <strong>Metadata Date</strong>
+                        <div th:text="${result.documentMetadata().xmpMetadata().metadataDate()}">2025-01-02</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <details class="raw-text-panel" th:if="${result.extractedText() != null}" open>
+            <summary>Raw Document Text</summary>
+            <pre class="raw-text" th:text="${result.extractedText()}">Raw PDF text will appear here</pre>
+        </details>
+
+        <form method="post" action="/export" id="csvForm" th:if="${#lists.size(result.rows()) > 0}">
+            <div class="table-controls">
+                <div>
+                    <strong th:text="${#lists.size(result.rows())}">0</strong> rows detected
+                </div>
+                <div class="pagination">
+                    <button type="button" id="prevPage">Prev</button>
+                    <span id="pageInfo" class="hint">Page 1 / 1</span>
+                    <button type="button" id="nextPage">Next</button>
+                </div>
+            </div>
+            <table id="transactionsTable">
+                <thead>
+                <tr>
+                    <th class="checkbox-col">
+                        <input type="checkbox" id="selectAll"/>
+                    </th>
+                    <th>月</th>
+                    <th>日</th>
+                    <th>種別 (入)</th>
+                    <th>利用駅 (入)</th>
+                    <th>種別 (出)</th>
+                    <th>利用駅 (出)</th>
+                    <th>残高</th>
+                    <th>入金・利用金額</th>
+                </tr>
+                </thead>
+                <tbody>
+                <tr th:each="row : ${result.rows()}">
+                    <td class="checkbox-col">
+                        <input type="checkbox" name="rowIds" th:value="${row.rowNumber()}"/>
+                    </td>
+                    <td th:text="${row.month()}">10</td>
+                    <td th:text="${row.day()}">21</td>
+                    <td th:text="${row.typeIn()}">入</td>
+                    <td th:text="${row.stationIn()}">登戸</td>
+                    <td th:text="${row.typeOut()}">出</td>
+                    <td th:text="${row.stationOut()}">新宿</td>
+                    <td th:text="${row.balance()}">¥1,359</td>
+                    <td th:text="${row.amount()}">¥1,000</td>
+                </tr>
+                </tbody>
+            </table>
+            <button id="exportBtn" type="submit" disabled>Export CSV</button>
+        </form>
+    </section>
+
+</main>
+
+<script>
+    document.addEventListener("DOMContentLoaded", () => {
+        const table = document.getElementById("transactionsTable");
+        if (!table) {
+            return;
+        }
+
+        const rows = Array.from(table.querySelectorAll("tbody tr"));
+        const pageSize = 10;
+        let currentPage = 1;
+        const pageInfo = document.getElementById("pageInfo");
+        const prevBtn = document.getElementById("prevPage");
+        const nextBtn = document.getElementById("nextPage");
+
+        const renderPage = () => {
+            const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+            if (currentPage > totalPages) {
+                currentPage = totalPages;
+            }
+            rows.forEach((row, index) => {
+                const start = (currentPage - 1) * pageSize;
+                const end = start + pageSize;
+                row.style.display = index >= start && index < end ? "" : "none";
+            });
+            if (pageInfo) {
+                pageInfo.textContent = `Page ${currentPage} / ${totalPages}`;
+            }
+            if (prevBtn) {
+                prevBtn.disabled = currentPage === 1;
+            }
+            if (nextBtn) {
+                nextBtn.disabled = currentPage === totalPages;
+            }
+        };
+
+        prevBtn?.addEventListener("click", () => {
+            if (currentPage > 1) {
+                currentPage--;
+                renderPage();
+            }
+        });
+        nextBtn?.addEventListener("click", () => {
+            const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+            if (currentPage < totalPages) {
+                currentPage++;
+                renderPage();
+            }
+        });
+        renderPage();
+
+        const selectAll = document.getElementById("selectAll");
+        const exportBtn = document.getElementById("exportBtn");
+        const rowCheckboxes = Array.from(table.querySelectorAll('tbody input[type="checkbox"]'));
+
+        const updateExportState = () => {
+            const hasSelection = rowCheckboxes.some(cb => cb.checked);
+            if (exportBtn) {
+                exportBtn.disabled = !hasSelection;
+            }
+        };
+
+        selectAll?.addEventListener("change", (event) => {
+            const checked = event.target.checked;
+            rowCheckboxes.forEach(cb => {
+                cb.checked = checked;
+            });
+            updateExportState();
+        });
+
+        rowCheckboxes.forEach(cb => cb.addEventListener("change", () => {
+            if (!cb.checked && selectAll) {
+                selectAll.checked = false;
+            }
+            updateExportState();
+        }));
+
+        updateExportState();
+    });
+</script>
+</body>
+</html>
