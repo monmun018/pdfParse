@@ -2,6 +2,7 @@ package com.example.demo.application.service;
 
 import com.example.demo.domain.model.StatementMetadata;
 import com.example.demo.domain.model.SuicaStatementRow;
+import com.example.demo.domain.model.SuicaPdfType;
 import com.example.demo.infrastructure.pdf.PdfBoxMetadataReader;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -33,8 +34,10 @@ class PdfTextServiceTableParserTests {
         lines.add(line(30f, "10", "21", "ｶｰﾄﾞ", "モバイル", "", "", "¥3,098", "+2,000"));
 
         StatementMetadata metadata = new StatementMetadata(null, null, null, null, LocalDate.of(2024, 10, 31));
-        List<SuicaStatementRow> rows = service.parseTableLines(lines, metadata);
+        PdfTextService.TableParseResult parseResult = service.parseTableLines(lines, metadata);
+        List<SuicaStatementRow> rows = parseResult.rows();
 
+        assertThat(parseResult.pdfType()).isEqualTo(SuicaPdfType.FULL_HISTORY);
         assertThat(rows).hasSize(3);
 
         SuicaStatementRow carry = rows.get(0);
@@ -74,8 +77,10 @@ class PdfTextServiceTableParserTests {
         lines.add(line(10f, "10", "22", "物販", "", "出", "渋谷", "¥568", "-2,530"));
 
         StatementMetadata metadata = new StatementMetadata(null, null, null, null, LocalDate.of(2024, 10, 31));
-        List<SuicaStatementRow> rows = service.parseTableLines(lines, metadata);
+        PdfTextService.TableParseResult parseResult = service.parseTableLines(lines, metadata);
+        List<SuicaStatementRow> rows = parseResult.rows();
 
+        assertThat(parseResult.pdfType()).isEqualTo(SuicaPdfType.FULL_HISTORY);
         assertThat(rows).hasSize(1);
         SuicaStatementRow retail = rows.get(0);
         assertThat(retail.typeIn()).isEqualTo("物販");
@@ -83,6 +88,24 @@ class PdfTextServiceTableParserTests {
         assertThat(retail.stationOut()).isEmpty();
         assertThat(retail.balance()).isEqualTo("¥568");
         assertThat(retail.amount()).isEqualTo("-2,530");
+    }
+
+    @Test
+    void detectPartialSelectionPdfAndLeavesBalanceEmpty() {
+        List<PdfTextService.TableLine> lines = new ArrayList<>();
+        lines.add(line(0f, "月", "日", "種別(入)", "利用駅(入)", "種別(出)", "利用駅(出)", "入金・利用額"));
+        lines.add(line(15f, "11", "17", "入", "東京", "出", "神田", "-160"));
+
+        StatementMetadata metadata = new StatementMetadata(null, null, null, null, LocalDate.of(2024, 11, 30));
+
+        PdfTextService.TableParseResult parseResult = service.parseTableLines(lines, metadata);
+        List<SuicaStatementRow> rows = parseResult.rows();
+
+        assertThat(parseResult.pdfType()).isEqualTo(SuicaPdfType.PARTIAL_SELECTION);
+        assertThat(rows).hasSize(1);
+        SuicaStatementRow ride = rows.get(0);
+        assertThat(ride.balance()).isNull();
+        assertThat(ride.amount()).isEqualTo("-160");
     }
 
     private PdfTextService.TableLine line(float y, String... values) {

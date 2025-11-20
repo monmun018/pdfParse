@@ -9,6 +9,7 @@ import com.example.demo.domain.model.PdfExtractionResult;
 import com.example.demo.domain.model.PdfFeature;
 import com.example.demo.domain.model.StatementMetadata;
 import com.example.demo.domain.model.SuicaStatementRow;
+import com.example.demo.domain.model.SuicaPdfType;
 import com.example.demo.infrastructure.exception.PdfProcessingException;
 import com.example.demo.infrastructure.pdf.PdfBoxMetadataReader;
 
@@ -34,6 +35,7 @@ import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -55,8 +57,9 @@ public class PdfTextService {
     private static final Pattern DATE_PATTERN = Pattern.compile("(\\d{4}/\\d{2}/\\d{2})");
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy/MM/dd");
     private static final Set<String> ENTRY_ONLY_TYPES = Set.of("ｶｰﾄﾞ", "カード", "ﾓﾊﾞｲﾙ", "モバイル", "物販");
-    private static final int COLUMN_COUNT = 8;
-    private static final List<ColumnDefinition> COLUMN_DEFINITIONS = List.of(
+    private static final int FULL_COLUMN_COUNT = 8;
+    private static final int PARTIAL_COLUMN_COUNT = 7;
+    private static final List<ColumnDefinition> FULL_COLUMN_DEFINITIONS = List.of(
             new ColumnDefinition("month", List.of("月")),
             new ColumnDefinition("day", List.of("日")),
             new ColumnDefinition("typeIn", List.of("種別")),
@@ -64,6 +67,15 @@ public class PdfTextService {
             new ColumnDefinition("typeOut", List.of("種別")),
             new ColumnDefinition("stationOut", List.of("利用駅")),
             new ColumnDefinition("balance", List.of("残高")),
+            new ColumnDefinition("amount", List.of("入金", "利用金額"))
+    );
+    private static final List<ColumnDefinition> PARTIAL_COLUMN_DEFINITIONS = List.of(
+            new ColumnDefinition("month", List.of("月")),
+            new ColumnDefinition("day", List.of("日")),
+            new ColumnDefinition("typeIn", List.of("種別")),
+            new ColumnDefinition("stationIn", List.of("利用駅")),
+            new ColumnDefinition("typeOut", List.of("種別")),
+            new ColumnDefinition("stationOut", List.of("利用駅")),
             new ColumnDefinition("amount", List.of("入金", "利用金額"))
     );
 
@@ -178,6 +190,7 @@ public class PdfTextService {
             String rawText = null;
             StatementMetadata metadata = null;
             List<SuicaStatementRow> rows = Collections.emptyList();
+            SuicaPdfType pdfType = SuicaPdfType.FULL_HISTORY;
 
             boolean needsDocumentText = features.contains(PdfFeature.RAW_TEXT) || features.contains(PdfFeature.STATEMENT_METADATA);
             if (needsDocumentText) {
@@ -188,7 +201,9 @@ public class PdfTextService {
             }
             if (features.contains(PdfFeature.TABLE_ROWS)) {
                 List<TableLine> tableLines = extractStatementTable(document);
-                rows = parseTableLines(tableLines, metadata);
+                TableParseResult tableParse = parseTableLines(tableLines, metadata);
+                rows = tableParse.rows();
+                pdfType = tableParse.pdfType();
             }
 
             return new PdfExtractionResult(
@@ -199,7 +214,8 @@ public class PdfTextService {
                     features.contains(PdfFeature.RAW_TEXT) ? rawText : null,
                     features.contains(PdfFeature.DOCUMENT_METADATA)
                             ? metadataReader.readMetadata(document, bytes.length)
-                            : null
+                            : null,
+                    pdfType
             );
         }
     }
@@ -304,20 +320,22 @@ public class PdfTextService {
     /**
      * Converts the extracted table text into domain rows.
      *
-     * @param tableText raw multiline table content
+     * @param tableLines parsed lines with positional information
      * @param metadata  statement metadata used for contextual fields
      * @return parsed row list (possibly empty)
      */
-    List<SuicaStatementRow> parseTableLines(List<TableLine> tableLines, StatementMetadata metadata) {
+    TableParseResult parseTableLines(List<TableLine> tableLines, StatementMetadata metadata) {
         if (tableLines == null || tableLines.isEmpty()) {
-            return Collections.emptyList();
+            return new TableParseResult(Collections.emptyList(), SuicaPdfType.FULL_HISTORY);
         }
 
         TableLine headerLine = findHeaderLine(tableLines);
-        ColumnLayout columnLayout = ColumnLayout.build(headerLine, tableLines, log);
+        SuicaPdfType pdfType = detectPdfType(headerLine, tableLines);
+        List<ColumnDefinition> definitions = columnDefinitionsFor(pdfType);
+        ColumnLayout columnLayout = ColumnLayout.build(headerLine, tableLines, definitions, log);
         if (columnLayout == null) {
             log.warn("Unable to determine column layout for the statement table.");
-            return Collections.emptyList();
+            return new TableParseResult(Collections.emptyList(), pdfType);
         }
 
         List<SuicaStatementRow> rows = new ArrayList<>();
@@ -345,16 +363,34 @@ public class PdfTextService {
                 continue;
             }
             List<String> columns = columnLayout.extractColumns(tableLine, this::cleanToken);
-            if (columns.size() != COLUMN_COUNT) {
+            if (columns.size() != definitions.size()) {
                 continue;
             }
-            SuicaStatementRow row = toRow(columns, rowNumber, metadata);
+            SuicaStatementRow row = toRow(columns, rowNumber, metadata, pdfType);
             if (row != null) {
                 rows.add(row);
                 rowNumber++;
             }
         }
-        return rows;
+        return new TableParseResult(rows, pdfType);
+    }
+
+    static final class TableParseResult {
+        private final List<SuicaStatementRow> rows;
+        private final SuicaPdfType pdfType;
+
+        TableParseResult(List<SuicaStatementRow> rows, SuicaPdfType pdfType) {
+            this.rows = rows == null ? Collections.emptyList() : rows;
+            this.pdfType = pdfType == null ? SuicaPdfType.FULL_HISTORY : pdfType;
+        }
+
+        List<SuicaStatementRow> rows() {
+            return rows;
+        }
+
+        SuicaPdfType pdfType() {
+            return pdfType;
+        }
     }
 
     /**
@@ -377,6 +413,52 @@ public class PdfTextService {
             }
         }
         return null;
+    }
+
+    /**
+     * Determines the PDF type (full history vs partial selection) based on header keywords and token counts.
+     *
+     * @param headerLine detected header line (may be null)
+     * @param lines      all table lines
+     * @return inferred PDF type
+     */
+    private SuicaPdfType detectPdfType(TableLine headerLine, List<TableLine> lines) {
+        boolean headerHasBalance = false;
+        boolean headerHasAmount = false;
+        if (headerLine != null) {
+            for (PositionedToken token : headerLine.tokens()) {
+                String normalized = normalizeHeaderToken(token.text());
+                if (normalized.contains("残高")) {
+                    headerHasBalance = true;
+                }
+                if (normalized.contains("入金利用金額") || normalized.contains("入金利用額") || normalized.contains("入金利用金")) {
+                    headerHasAmount = true;
+                }
+            }
+        }
+        if (headerHasAmount && !headerHasBalance) {
+            return SuicaPdfType.PARTIAL_SELECTION;
+        }
+        if (headerHasBalance) {
+            return SuicaPdfType.FULL_HISTORY;
+        }
+
+        int maxTokenCount = lines == null
+                ? 0
+                : lines.stream()
+                .filter(Objects::nonNull)
+                .mapToInt(line -> line.tokens().size())
+                .max()
+                .orElse(0);
+        if (maxTokenCount > 0 && maxTokenCount <= PARTIAL_COLUMN_COUNT) {
+            return SuicaPdfType.PARTIAL_SELECTION;
+        }
+
+        return SuicaPdfType.FULL_HISTORY;
+    }
+
+    private List<ColumnDefinition> columnDefinitionsFor(SuicaPdfType pdfType) {
+        return pdfType == SuicaPdfType.PARTIAL_SELECTION ? PARTIAL_COLUMN_DEFINITIONS : FULL_COLUMN_DEFINITIONS;
     }
 
     /**
@@ -426,23 +508,24 @@ public class PdfTextService {
      * @param metadata       heading metadata required to compute the year-month column
      * @return parsed row or {@code null} when the tokens do not look like a data row
      */
-    private SuicaStatementRow toRow(List<String> columns, int rowNumber, StatementMetadata metadata) {
-        if (columns == null || columns.size() < COLUMN_COUNT) {
+    private SuicaStatementRow toRow(List<String> columns, int rowNumber, StatementMetadata metadata, SuicaPdfType pdfType) {
+        if (columns == null || columns.isEmpty()) {
             return null;
         }
 
-        String month = columns.get(0);
-        String day = columns.get(1);
+        String month = getColumn(columns, 0);
+        String day = getColumn(columns, 1);
         if ((month == null || month.isBlank()) && (day == null || day.isBlank())) {
             return null;
         }
 
-        String typeIn = columns.get(2);
-        String stationIn = columns.get(3);
-        String typeOut = columns.get(4);
-        String stationOut = columns.get(5);
-        String balance = normalizeCurrency(columns.get(6), true);
-        String amount = normalizeCurrency(columns.get(7), false);
+        String typeIn = getColumn(columns, 2);
+        String stationIn = getColumn(columns, 3);
+        String typeOut = getColumn(columns, 4);
+        String stationOut = getColumn(columns, 5);
+        String balance = pdfType.hasBalanceColumn() ? normalizeCurrency(getColumn(columns, 6), true) : null;
+        int amountIndex = pdfType.hasBalanceColumn() ? 7 : 6;
+        String amount = normalizeCurrency(getColumn(columns, amountIndex), false);
 
         if (ENTRY_ONLY_TYPES.contains(typeIn)) {
             typeOut = "";
@@ -469,6 +552,14 @@ public class PdfTextService {
                 balance,
                 amount
         );
+    }
+
+    private String getColumn(List<String> columns, int index) {
+        if (index >= columns.size() || index < 0) {
+            return "";
+        }
+        String value = columns.get(index);
+        return value == null ? "" : value.trim();
     }
 
     /**
@@ -579,21 +670,24 @@ public class PdfTextService {
     private static final class ColumnLayout {
         private static final float PADDING = 2f;
         private final List<ColumnBoundary> boundaries;
+        private final int columnCount;
 
-        private ColumnLayout(List<ColumnBoundary> boundaries) {
+        private ColumnLayout(List<ColumnBoundary> boundaries, int columnCount) {
             this.boundaries = boundaries;
+            this.columnCount = columnCount;
         }
 
-        static ColumnLayout build(TableLine headerLine, List<TableLine> lines, Logger log) {
+        static ColumnLayout build(TableLine headerLine, List<TableLine> lines, List<ColumnDefinition> definitions, Logger log) {
+            int columnCount = definitions.size();
             float minX = computeMinX(lines, headerLine) - PADDING;
-            float maxX = computeMaxX(lines, headerLine) + PADDING;
+            float maxX = computeMaxX(lines, headerLine, columnCount) + PADDING;
             if (maxX <= minX) {
-                maxX = minX + COLUMN_COUNT;
+                maxX = minX + columnCount;
             }
 
-            List<Float> anchors = headerLine != null ? detectAnchors(headerLine) : Collections.emptyList();
-            if (headerLine != null && anchors.size() == COLUMN_COUNT) {
-                return new ColumnLayout(toBoundaries(anchors, minX, maxX));
+            List<Float> anchors = headerLine != null ? detectAnchors(headerLine, definitions) : Collections.emptyList();
+            if (headerLine != null && anchors.size() == columnCount) {
+                return new ColumnLayout(toBoundaries(anchors, minX, maxX, columnCount), columnCount);
             }
 
             if (headerLine == null) {
@@ -601,12 +695,12 @@ public class PdfTextService {
             } else {
                 log.warn("Detected only {} header anchors; falling back to evenly spaced columns.", anchors.size());
             }
-            return new ColumnLayout(buildEvenBoundaries(minX, maxX));
+            return new ColumnLayout(buildEvenBoundaries(minX, maxX, columnCount), columnCount);
         }
 
         List<String> extractColumns(TableLine line, Function<String, String> cleaner) {
-            List<StringBuilder> builders = new ArrayList<>(COLUMN_COUNT);
-            for (int i = 0; i < COLUMN_COUNT; i++) {
+            List<StringBuilder> builders = new ArrayList<>(columnCount);
+            for (int i = 0; i < columnCount; i++) {
                 builders.add(new StringBuilder());
             }
             for (PositionedToken token : line.tokens()) {
@@ -624,7 +718,7 @@ public class PdfTextService {
                 }
                 builder.append(raw);
             }
-            List<String> values = new ArrayList<>(COLUMN_COUNT);
+            List<String> values = new ArrayList<>(columnCount);
             for (StringBuilder builder : builders) {
                 values.add(cleaner.apply(builder.toString()));
             }
@@ -641,11 +735,12 @@ public class PdfTextService {
             return -1;
         }
 
-        private static List<Float> detectAnchors(TableLine headerLine) {
-            List<Float> anchors = new ArrayList<>(COLUMN_COUNT);
+        private static List<Float> detectAnchors(TableLine headerLine, List<ColumnDefinition> definitions) {
+            int columnCount = definitions.size();
+            List<Float> anchors = new ArrayList<>(columnCount);
             List<PositionedToken> tokens = headerLine.tokens();
             int tokenIndex = 0;
-            for (ColumnDefinition definition : COLUMN_DEFINITIONS) {
+            for (ColumnDefinition definition : definitions) {
                 Float anchor = null;
                 for (int i = tokenIndex; i < tokens.size(); i++) {
                     String normalized = normalizeHeaderToken(tokens.get(i).text());
@@ -666,23 +761,23 @@ public class PdfTextService {
             return anchors;
         }
 
-        private static List<ColumnBoundary> toBoundaries(List<Float> anchors, float minX, float maxX) {
-            List<ColumnBoundary> boundaries = new ArrayList<>(COLUMN_COUNT);
-            for (int i = 0; i < COLUMN_COUNT; i++) {
+        private static List<ColumnBoundary> toBoundaries(List<Float> anchors, float minX, float maxX, int columnCount) {
+            List<ColumnBoundary> boundaries = new ArrayList<>(columnCount);
+            for (int i = 0; i < columnCount; i++) {
                 float start = i == 0 ? minX : midpoint(anchors.get(i - 1), anchors.get(i));
-                float end = i == COLUMN_COUNT - 1 ? maxX : midpoint(anchors.get(i), anchors.get(i + 1));
+                float end = i == columnCount - 1 ? maxX : midpoint(anchors.get(i), anchors.get(i + 1));
                 boundaries.add(new ColumnBoundary(start, end));
             }
             return boundaries;
         }
 
-        private static List<ColumnBoundary> buildEvenBoundaries(float minX, float maxX) {
-            List<ColumnBoundary> boundaries = new ArrayList<>(COLUMN_COUNT);
-            float width = Math.max(maxX - minX, COLUMN_COUNT);
-            float columnWidth = width / COLUMN_COUNT;
+        private static List<ColumnBoundary> buildEvenBoundaries(float minX, float maxX, int columnCount) {
+            List<ColumnBoundary> boundaries = new ArrayList<>(columnCount);
+            float width = Math.max(maxX - minX, columnCount);
+            float columnWidth = width / columnCount;
             float start = minX;
-            for (int i = 0; i < COLUMN_COUNT; i++) {
-                float end = i == COLUMN_COUNT - 1 ? maxX : start + columnWidth;
+            for (int i = 0; i < columnCount; i++) {
+                float end = i == columnCount - 1 ? maxX : start + columnWidth;
                 boundaries.add(new ColumnBoundary(start, end));
                 start = end;
             }
@@ -700,13 +795,13 @@ public class PdfTextService {
             return min;
         }
 
-        private static float computeMaxX(List<TableLine> lines, TableLine headerLine) {
+        private static float computeMaxX(List<TableLine> lines, TableLine headerLine, int columnCount) {
             float max = headerLine != null ? headerLine.maxX() : Float.MIN_VALUE;
             for (TableLine line : lines) {
                 max = Math.max(max, line.maxX());
             }
             if (max == Float.MIN_VALUE) {
-                return COLUMN_COUNT;
+                return columnCount;
             }
             return max;
         }
@@ -1014,7 +1109,6 @@ public class PdfTextService {
                 && flattened.contains("日")
                 && typeCount >= 2
                 && stationCount >= 2
-                && flattened.contains("残高")
                 && hasAmount;
     }
 

@@ -3,6 +3,7 @@ package com.example.demo.application.service;
 import com.example.demo.application.exception.CsvExportValidationException;
 import com.example.demo.domain.model.PdfExtractionResult;
 import com.example.demo.domain.model.SuicaStatementRow;
+import com.example.demo.domain.model.SuicaPdfType;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -56,6 +57,6 @@ class CsvExportServiceTest {
                 new SuicaStatementRow(1, "2024-01", "01", "10", "IN", "StationA", "OUT", "StationB", "¥1000", "¥500"),
                 new SuicaStatementRow(2, "2024-02", "02", "15", "IN", "StationC", "OUT", "StationD", "¥2000", "¥800")
         );
-        return new PdfExtractionResult("sample.pdf", 2, null, rows, null, null);
+        return new PdfExtractionResult("sample.pdf", 2, null, rows, null, null, SuicaPdfType.FULL_HISTORY);
     }
 }

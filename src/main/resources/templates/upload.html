@@ -204,6 +204,12 @@
                 <strong>Total pages</strong>
                 <div th:text="${result.pageCount()}">2</div>
             </div>
+            <div>
+                <strong>PDF Type</strong>
+                <div th:text="${result.pdfType() == T(com.example.demo.domain.model.SuicaPdfType).PARTIAL_SELECTION ? 'Partial selection (amount only)' : 'Full history'}">
+                    Full history
+                </div>
+            </div>
         </div>
 
         <section th:if="${result.documentMetadata() != null}">
@@ -305,6 +311,9 @@
             <div class="table-controls">
                 <div>
                     <strong th:text="${#lists.size(result.rows())}">0</strong> rows detected
+                    <span class="hint" th:if="${result.pdfType() == T(com.example.demo.domain.model.SuicaPdfType).PARTIAL_SELECTION}">
+                        Balance is not present in this partial-selection PDF.
+                    </span>
                 </div>
                 <div class="pagination">
                     <button type="button" id="prevPage">Prev</button>

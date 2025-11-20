@@ -4,6 +4,7 @@ import com.example.demo.domain.exception.PdfFileRequiredException;
 import com.example.demo.domain.exception.UnsupportedPdfFormatException;
 import com.example.demo.domain.model.PdfExtractionResult;
 import com.example.demo.domain.model.PdfFeature;
+import com.example.demo.domain.model.SuicaPdfType;
 import com.example.demo.infrastructure.pdf.PdfBoxMetadataReader;
 
 import org.apache.pdfbox.pdmodel.PDDocument;
@@ -127,6 +128,23 @@ class PdfTextServiceTest {
         assertThat(result.metadata()).isNull();
         assertThat(result.extractedText()).isNull();
         assertThat(result.documentMetadata()).isNull();
+    }
+
+    @Test
+    void extractTextSupportsPartialSelectionPdfsWithoutBalance() throws Exception {
+        Path partialPdf = Path.of("source/JE80FA22030423963_20251117_20251120221126.pdf");
+        assumeTrue(Files.exists(partialPdf), "Partial selection PDF fixture missing");
+
+        PdfExtractionResult result = pdfTextService.extractText(partialPdf, EnumSet.of(
+                PdfFeature.TABLE_ROWS,
+                PdfFeature.STATEMENT_METADATA,
+                PdfFeature.RAW_TEXT
+        ));
+
+        assertThat(result.pdfType()).isEqualTo(SuicaPdfType.PARTIAL_SELECTION);
+        assertThat(result.rows()).isNotEmpty();
+        assertThat(result.rows()).allSatisfy(row -> assertThat(row.balance()).isNullOrEmpty());
+        assertThat(result.rows().get(0).amount()).isNotBlank();
     }
 
     /**

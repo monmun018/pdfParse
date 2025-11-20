@@ -12,6 +12,7 @@ public record PdfExtractionResult(
         StatementMetadata metadata,
         List<SuicaStatementRow> rows,
         String extractedText,
-        PdfDocumentMetadata documentMetadata
+        PdfDocumentMetadata documentMetadata,
+        SuicaPdfType pdfType
 ) {
 }
