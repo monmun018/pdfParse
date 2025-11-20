@@ -29,12 +29,14 @@ import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -52,8 +54,18 @@ public class PdfTextService {
     private static final Pattern CARD_PATTERN = Pattern.compile("JE[\\d*\\s]+\\d{4}");
     private static final Pattern DATE_PATTERN = Pattern.compile("(\\d{4}/\\d{2}/\\d{2})");
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy/MM/dd");
-    private static final Pattern CURRENCY_TOKEN = Pattern.compile("^[+-]?[\\\\¥]?[\\d,]+$");
     private static final Set<String> ENTRY_ONLY_TYPES = Set.of("ｶｰﾄﾞ", "カード", "ﾓﾊﾞｲﾙ", "モバイル", "物販");
+    private static final int COLUMN_COUNT = 8;
+    private static final List<ColumnDefinition> COLUMN_DEFINITIONS = List.of(
+            new ColumnDefinition("month", List.of("月")),
+            new ColumnDefinition("day", List.of("日")),
+            new ColumnDefinition("typeIn", List.of("種別")),
+            new ColumnDefinition("stationIn", List.of("利用駅")),
+            new ColumnDefinition("typeOut", List.of("種別")),
+            new ColumnDefinition("stationOut", List.of("利用駅")),
+            new ColumnDefinition("balance", List.of("残高")),
+            new ColumnDefinition("amount", List.of("入金", "利用金額"))
+    );
 
     private final PdfBoxMetadataReader metadataReader;
 
@@ -175,8 +187,8 @@ public class PdfTextService {
                 metadata = extractMetadata(rawText);
             }
             if (features.contains(PdfFeature.TABLE_ROWS)) {
-                String tableText = extractStatementTable(document);
-                rows = parseTableText(tableText, metadata);
+                List<TableLine> tableLines = extractStatementTable(document);
+                rows = parseTableLines(tableLines, metadata);
             }
 
             return new PdfExtractionResult(
@@ -261,8 +273,8 @@ public class PdfTextService {
      * @return concatenated table text spanning all pages
      * @throws IOException when PDFBox cannot read the table region
      */
-    private String extractStatementTable(PDDocument document) throws IOException {
-        StringBuilder builder = new StringBuilder();
+    private List<TableLine> extractStatementTable(PDDocument document) throws IOException {
+        List<TableLine> lines = new ArrayList<>();
 
         for (int pageIndex = 0; pageIndex < document.getNumberOfPages(); pageIndex++) {
             PDPage page = document.getPage(pageIndex);
@@ -272,25 +284,21 @@ public class PdfTextService {
                 continue;
             }
 
-            PDFTextStripperByArea areaStripper = new PDFTextStripperByArea();
-            configureStripper(areaStripper);
-            areaStripper.setLineSeparator("\n");
-            areaStripper.setWordSeparator(" ");
-            areaStripper.setParagraphEnd("\n");
-            areaStripper.setAddMoreFormatting(true);
-            areaStripper.setAverageCharTolerance(0.12f);
-            areaStripper.setSpacingTolerance(0.2f);
-            areaStripper.addRegion("table", region);
-            areaStripper.extractRegions(page);
-            String tablePageText = areaStripper.getTextForRegion("table").strip();
-            if (!tablePageText.isEmpty()) {
-                if (!builder.isEmpty()) {
-                    builder.append("\n");
-                }
-                builder.append(tablePageText);
-            }
+            TableRegionStripper stripper = new TableRegionStripper(region);
+            configureStripper(stripper);
+            stripper.setLineSeparator("\n");
+            stripper.setWordSeparator(" ");
+            stripper.setParagraphEnd("\n");
+            stripper.setAddMoreFormatting(true);
+            stripper.setAverageCharTolerance(0.12f);
+            stripper.setSpacingTolerance(0.2f);
+            stripper.setSortByPosition(true);
+            stripper.setStartPage(pageIndex + 1);
+            stripper.setEndPage(pageIndex + 1);
+            stripper.getText(document);
+            lines.addAll(stripper.getLines());
         }
-        return builder.toString().strip();
+        return lines;
     }
 
     /**
@@ -300,16 +308,23 @@ public class PdfTextService {
      * @param metadata  statement metadata used for contextual fields
      * @return parsed row list (possibly empty)
      */
-    private List<SuicaStatementRow> parseTableText(String tableText, StatementMetadata metadata) {
-        if (tableText.isEmpty()) {
+    List<SuicaStatementRow> parseTableLines(List<TableLine> tableLines, StatementMetadata metadata) {
+        if (tableLines == null || tableLines.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        TableLine headerLine = findHeaderLine(tableLines);
+        ColumnLayout columnLayout = ColumnLayout.build(headerLine, tableLines, log);
+        if (columnLayout == null) {
+            log.warn("Unable to determine column layout for the statement table.");
             return Collections.emptyList();
         }
 
         List<SuicaStatementRow> rows = new ArrayList<>();
         int rowNumber = 1;
         boolean headerSeen = false;
-        for (String rawLine : tableText.split("\\R")) {
-            String line = rawLine.strip();
+        for (TableLine tableLine : tableLines) {
+            String line = tableLine.text();
             if (line.isEmpty()) {
                 continue;
             }
@@ -329,14 +344,39 @@ public class PdfTextService {
             if (isFooterLine(line)) {
                 continue;
             }
-        List<String> tokens = tokenize(line);
-        SuicaStatementRow row = toRow(tokens, rowNumber, metadata);
-        if (row != null) {
-            rows.add(row);
-            rowNumber++;
-        }
+            List<String> columns = columnLayout.extractColumns(tableLine, this::cleanToken);
+            if (columns.size() != COLUMN_COUNT) {
+                continue;
+            }
+            SuicaStatementRow row = toRow(columns, rowNumber, metadata);
+            if (row != null) {
+                rows.add(row);
+                rowNumber++;
+            }
         }
         return rows;
+    }
+
+    /**
+     * Locates the first table line that matches the expected header structure.
+     *
+     * @param lines extracted table lines
+     * @return header line or {@code null} when undetected
+     */
+    private TableLine findHeaderLine(List<TableLine> lines) {
+        if (lines == null) {
+            return null;
+        }
+        for (TableLine line : lines) {
+            if (line == null) {
+                continue;
+            }
+            String text = line.text();
+            if (text != null && isHeaderLine(text)) {
+                return line;
+            }
+        }
+        return null;
     }
 
     /**
@@ -364,34 +404,6 @@ public class PdfTextService {
     }
 
     /**
-     * Tokenizes a table row by trying several separator strategies (tabs, double spaces, fallback singles).
-     *
-     * @param line original line extracted from the PDF
-     * @return ordered tokens ready for mapping to domain fields
-     */
-    private List<String> tokenize(String line) {
-        String normalized = line.replace('\u3000', ' ');
-        List<String> tokens = new ArrayList<>(Arrays.stream(normalized.split("\t"))
-                .map(this::cleanToken)
-                .filter(token -> !token.isEmpty())
-                .toList());
-
-        if (tokens.size() < 6) {
-            tokens = new ArrayList<>(Arrays.stream(normalized.split("\\s{2,}"))
-                    .map(this::cleanToken)
-                    .filter(token -> !token.isEmpty())
-                    .toList());
-        }
-        if (tokens.size() < 5) {
-            tokens = new ArrayList<>(Arrays.stream(normalized.split("\\s+"))
-                    .map(this::cleanToken)
-                    .filter(token -> !token.isEmpty())
-                    .toList());
-        }
-        return tokens;
-    }
-
-    /**
      * Normalizes a token by trimming whitespace and replacing stray backslashes with Yen symbols.
      *
      * @param token raw token
@@ -409,34 +421,28 @@ public class PdfTextService {
      * compact 6-column variant (no explicit 出 columns). When fallback mapping kicks in
      * we keep exit columns empty and log for visibility.
      *
-     * @param originalTokens tokens extracted from one table line
+     * @param columns        normalized column values
      * @param rowNumber      sequential row counter used for display
      * @param metadata       heading metadata required to compute the year-month column
      * @return parsed row or {@code null} when the tokens do not look like a data row
      */
-    private SuicaStatementRow toRow(List<String> originalTokens, int rowNumber, StatementMetadata metadata) {
-        if (originalTokens.size() < 3) {
+    private SuicaStatementRow toRow(List<String> columns, int rowNumber, StatementMetadata metadata) {
+        if (columns == null || columns.size() < COLUMN_COUNT) {
             return null;
         }
 
-        List<String> tokens = new ArrayList<>(originalTokens);
-        String amount = extractCurrency(tokens, false);
-        String balance = extractCurrency(tokens, true);
-
-        String month = getToken(tokens, 0);
-        String day = getToken(tokens, 1);
-        String typeIn = getToken(tokens, 2);
-        String stationIn = getToken(tokens, 3);
-        String typeOut = "";
-        String stationOut = "";
-
-        boolean fallbackMapping = false;
-        if (tokens.size() >= 6) {
-            typeOut = getToken(tokens, 4);
-            stationOut = getToken(tokens, 5);
-        } else {
-            fallbackMapping = true;
+        String month = columns.get(0);
+        String day = columns.get(1);
+        if ((month == null || month.isBlank()) && (day == null || day.isBlank())) {
+            return null;
         }
+
+        String typeIn = columns.get(2);
+        String stationIn = columns.get(3);
+        String typeOut = columns.get(4);
+        String stationOut = columns.get(5);
+        String balance = normalizeCurrency(columns.get(6), true);
+        String amount = normalizeCurrency(columns.get(7), false);
 
         if (ENTRY_ONLY_TYPES.contains(typeIn)) {
             typeOut = "";
@@ -449,13 +455,6 @@ public class PdfTextService {
             stationIn = "";
         }
 
-        if (fallbackMapping && (!balance.isEmpty() || !amount.isEmpty())) {
-            log.debug("Row {} parsed with fallback column mapping. tokens={}", rowNumber, originalTokens);
-        }
-
-        if (month.isEmpty() && day.isEmpty()) {
-            return null;
-        }
         String yearMonth = buildYearMonth(month, metadata);
 
         return new SuicaStatementRow(
@@ -470,38 +469,6 @@ public class PdfTextService {
                 balance,
                 amount
         );
-    }
-
-    /**
-     * Removes and returns the last currency-looking token from the row.
-     *
-     * @param tokens    mutable token list (will be modified)
-     * @param prefixYen whether to force a leading Yen sign
-     * @return normalized currency value or empty string
-     */
-    private String extractCurrency(List<String> tokens, boolean prefixYen) {
-        for (int i = tokens.size() - 1; i >= 0; i--) {
-            String token = tokens.get(i);
-            if (isCurrencyToken(token)) {
-                tokens.remove(i);
-                return normalizeCurrency(token, prefixYen);
-            }
-        }
-        return "";
-    }
-
-    /**
-     * Determines if a token should be treated as a currency column.
-     *
-     * @param token token to check
-     * @return {@code true} when the token looks like an amount or balance
-     */
-    private boolean isCurrencyToken(String token) {
-        if (token == null) {
-            return false;
-        }
-        String cleaned = token.replace(",", "").replace("¥", "").replace("\\", "");
-        return CURRENCY_TOKEN.matcher(token).matches() || cleaned.matches("^[+-]?\\d+$");
     }
 
     /**
@@ -572,21 +539,6 @@ public class PdfTextService {
     }
 
     /**
-     * Safely retrieves a token from the list.
-     *
-     * @param tokens token list
-     * @param index  position to read
-     * @return value or empty string when out of bounds
-     */
-    private String getToken(List<String> tokens, int index) {
-        if (index >= tokens.size()) {
-            return "";
-        }
-        String token = tokens.get(index);
-        return token == null ? "" : token.trim();
-    }
-
-    /**
      * Finds the first line matching the supplied predicate.
      *
      * @param lines     normalized lines
@@ -606,6 +558,364 @@ public class PdfTextService {
         stripper.setSortByPosition(true);
         stripper.setShouldSeparateByBeads(true);
         stripper.setSuppressDuplicateOverlappingText(false);
+    }
+
+    /**
+     * Normalizes header tokens by stripping whitespace and punctuation for easier matching.
+     *
+     * @param token raw header token
+     * @return normalized token string
+     */
+    private static String normalizeHeaderToken(String token) {
+        if (token == null) {
+            return "";
+        }
+        return token.replaceAll("[\\s　()（）・・／/\\-]", "");
+    }
+
+    /**
+     * Groups table lines and maps tokens onto the eight logical columns based on header anchors.
+     */
+    private static final class ColumnLayout {
+        private static final float PADDING = 2f;
+        private final List<ColumnBoundary> boundaries;
+
+        private ColumnLayout(List<ColumnBoundary> boundaries) {
+            this.boundaries = boundaries;
+        }
+
+        static ColumnLayout build(TableLine headerLine, List<TableLine> lines, Logger log) {
+            float minX = computeMinX(lines, headerLine) - PADDING;
+            float maxX = computeMaxX(lines, headerLine) + PADDING;
+            if (maxX <= minX) {
+                maxX = minX + COLUMN_COUNT;
+            }
+
+            List<Float> anchors = headerLine != null ? detectAnchors(headerLine) : Collections.emptyList();
+            if (headerLine != null && anchors.size() == COLUMN_COUNT) {
+                return new ColumnLayout(toBoundaries(anchors, minX, maxX));
+            }
+
+            if (headerLine == null) {
+                log.warn("Table header text not detected; falling back to evenly spaced columns.");
+            } else {
+                log.warn("Detected only {} header anchors; falling back to evenly spaced columns.", anchors.size());
+            }
+            return new ColumnLayout(buildEvenBoundaries(minX, maxX));
+        }
+
+        List<String> extractColumns(TableLine line, Function<String, String> cleaner) {
+            List<StringBuilder> builders = new ArrayList<>(COLUMN_COUNT);
+            for (int i = 0; i < COLUMN_COUNT; i++) {
+                builders.add(new StringBuilder());
+            }
+            for (PositionedToken token : line.tokens()) {
+                int columnIndex = locateColumn(token.center());
+                if (columnIndex < 0) {
+                    continue;
+                }
+                String raw = token.text().strip();
+                if (raw.isEmpty()) {
+                    continue;
+                }
+                StringBuilder builder = builders.get(columnIndex);
+                if (builder.length() > 0) {
+                    builder.append(' ');
+                }
+                builder.append(raw);
+            }
+            List<String> values = new ArrayList<>(COLUMN_COUNT);
+            for (StringBuilder builder : builders) {
+                values.add(cleaner.apply(builder.toString()));
+            }
+            return values;
+        }
+
+        private int locateColumn(float center) {
+            for (int i = 0; i < boundaries.size(); i++) {
+                ColumnBoundary boundary = boundaries.get(i);
+                if (boundary.contains(center, i == boundaries.size() - 1)) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        private static List<Float> detectAnchors(TableLine headerLine) {
+            List<Float> anchors = new ArrayList<>(COLUMN_COUNT);
+            List<PositionedToken> tokens = headerLine.tokens();
+            int tokenIndex = 0;
+            for (ColumnDefinition definition : COLUMN_DEFINITIONS) {
+                Float anchor = null;
+                for (int i = tokenIndex; i < tokens.size(); i++) {
+                    String normalized = normalizeHeaderToken(tokens.get(i).text());
+                    if (normalized.isEmpty()) {
+                        continue;
+                    }
+                    if (definition.matches(normalized)) {
+                        anchor = tokens.get(i).center();
+                        tokenIndex = i + 1;
+                        break;
+                    }
+                }
+                if (anchor == null) {
+                    break;
+                }
+                anchors.add(anchor);
+            }
+            return anchors;
+        }
+
+        private static List<ColumnBoundary> toBoundaries(List<Float> anchors, float minX, float maxX) {
+            List<ColumnBoundary> boundaries = new ArrayList<>(COLUMN_COUNT);
+            for (int i = 0; i < COLUMN_COUNT; i++) {
+                float start = i == 0 ? minX : midpoint(anchors.get(i - 1), anchors.get(i));
+                float end = i == COLUMN_COUNT - 1 ? maxX : midpoint(anchors.get(i), anchors.get(i + 1));
+                boundaries.add(new ColumnBoundary(start, end));
+            }
+            return boundaries;
+        }
+
+        private static List<ColumnBoundary> buildEvenBoundaries(float minX, float maxX) {
+            List<ColumnBoundary> boundaries = new ArrayList<>(COLUMN_COUNT);
+            float width = Math.max(maxX - minX, COLUMN_COUNT);
+            float columnWidth = width / COLUMN_COUNT;
+            float start = minX;
+            for (int i = 0; i < COLUMN_COUNT; i++) {
+                float end = i == COLUMN_COUNT - 1 ? maxX : start + columnWidth;
+                boundaries.add(new ColumnBoundary(start, end));
+                start = end;
+            }
+            return boundaries;
+        }
+
+        private static float computeMinX(List<TableLine> lines, TableLine headerLine) {
+            float min = headerLine != null ? headerLine.minX() : Float.MAX_VALUE;
+            for (TableLine line : lines) {
+                min = Math.min(min, line.minX());
+            }
+            if (min == Float.MAX_VALUE) {
+                return 0f;
+            }
+            return min;
+        }
+
+        private static float computeMaxX(List<TableLine> lines, TableLine headerLine) {
+            float max = headerLine != null ? headerLine.maxX() : Float.MIN_VALUE;
+            for (TableLine line : lines) {
+                max = Math.max(max, line.maxX());
+            }
+            if (max == Float.MIN_VALUE) {
+                return COLUMN_COUNT;
+            }
+            return max;
+        }
+
+        private static float midpoint(float left, float right) {
+            return left + ((right - left) / 2f);
+        }
+    }
+
+    /**
+     * Defines a closed interval for a single statement column.
+     */
+    private static final class ColumnBoundary {
+        private static final float TOLERANCE = 0.5f;
+        private final float start;
+        private final float end;
+
+        ColumnBoundary(float start, float end) {
+            this.start = Math.min(start, end);
+            this.end = Math.max(start, end);
+        }
+
+        boolean contains(float value, boolean last) {
+            if (last) {
+                return value >= start - TOLERANCE && value <= end + TOLERANCE;
+            }
+            return value >= start - TOLERANCE && value < end - TOLERANCE;
+        }
+    }
+
+    /**
+     * Lightweight descriptor of one table column label with matching keywords.
+     */
+    private static final class ColumnDefinition {
+        private final String name;
+        private final List<String> keywords;
+
+        ColumnDefinition(String name, List<String> keywords) {
+            this.name = name;
+            this.keywords = keywords;
+        }
+
+        boolean matches(String normalizedToken) {
+            for (String keyword : keywords) {
+                if (normalizedToken.contains(keyword)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public String toString() {
+            return name;
+        }
+    }
+
+    /**
+     * Represents a single extracted table line with ordered positioned tokens.
+     */
+    static final class TableLine {
+        private final float y;
+        private final List<PositionedToken> tokens = new ArrayList<>();
+        private boolean sorted = false;
+
+        TableLine(float y) {
+            this.y = y;
+        }
+
+        void addToken(PositionedToken token) {
+            if (token == null) {
+                return;
+            }
+            tokens.add(token);
+            sorted = false;
+        }
+
+        List<PositionedToken> tokens() {
+            if (!sorted) {
+                tokens.sort(Comparator.comparing(PositionedToken::x));
+                sorted = true;
+            }
+            return tokens;
+        }
+
+        float minX() {
+            return tokens().stream()
+                    .map(PositionedToken::x)
+                    .min(Float::compareTo)
+                    .orElse(Float.MAX_VALUE);
+        }
+
+        float maxX() {
+            return tokens().stream()
+                    .map(PositionedToken::endX)
+                    .max(Float::compareTo)
+                    .orElse(Float.MIN_VALUE);
+        }
+
+        float y() {
+            return y;
+        }
+
+        String text() {
+            String joined = tokens().stream()
+                    .map(PositionedToken::text)
+                    .map(String::trim)
+                    .filter(value -> !value.isEmpty())
+                    .collect(Collectors.joining(" "));
+            return joined.trim();
+        }
+    }
+
+    /**
+     * Token extracted from the PDF with positional metadata.
+     */
+    static final class PositionedToken {
+        private final float x;
+        private final float endX;
+        private final String text;
+
+        PositionedToken(float x, float endX, String text) {
+            this.x = x;
+            this.endX = Math.max(endX, x);
+            this.text = text == null ? "" : text;
+        }
+
+        float x() {
+            return x;
+        }
+
+        float endX() {
+            return endX;
+        }
+
+        float center() {
+            return x + ((endX - x) / 2f);
+        }
+
+        String text() {
+            return text;
+        }
+    }
+
+    /**
+     * Strips text from a rectangular region while preserving token positions for column alignment.
+     */
+    private static final class TableRegionStripper extends PDFTextStripper {
+        private static final float Y_TOLERANCE = 1.5f;
+        private final Rectangle2D region;
+        private final List<TableLine> lines = new ArrayList<>();
+
+        TableRegionStripper(Rectangle2D region) throws IOException {
+            this.region = region;
+        }
+
+        List<TableLine> getLines() {
+            lines.sort(Comparator.comparing(TableLine::y));
+            return new ArrayList<>(lines);
+        }
+
+        @Override
+        protected void writeString(String text, List<TextPosition> textPositions) throws IOException {
+            List<TextPosition> filtered = new ArrayList<>();
+            for (TextPosition position : textPositions) {
+                float x = position.getXDirAdj();
+                float y = position.getYDirAdj();
+                if (region.contains(x, y)) {
+                    filtered.add(position);
+                }
+            }
+            if (!filtered.isEmpty()) {
+                StringBuilder builder = new StringBuilder();
+                for (TextPosition position : filtered) {
+                    builder.append(position.getUnicode());
+                }
+                String tokenText = builder.toString();
+                if (!tokenText.isBlank()) {
+                    float tokenX = filtered.stream()
+                            .map(TextPosition::getXDirAdj)
+                            .min(Float::compareTo)
+                            .orElse(0f);
+                    float tokenWidth = filtered.stream()
+                            .map(TextPosition::getWidthDirAdj)
+                            .reduce(0f, Float::sum);
+                    if (tokenWidth <= 0f) {
+                        tokenWidth = filtered.get(filtered.size() - 1).getWidthDirAdj();
+                    }
+                    tokenWidth = Math.max(tokenWidth, 0.5f);
+                    float tokenY = filtered.stream()
+                            .map(TextPosition::getYDirAdj)
+                            .min(Float::compareTo)
+                            .orElse(0f);
+                    resolveLine(tokenY).addToken(new PositionedToken(tokenX, tokenX + tokenWidth, tokenText));
+                }
+            }
+            super.writeString(text, textPositions);
+        }
+
+        private TableLine resolveLine(float y) {
+            for (TableLine line : lines) {
+                if (Math.abs(line.y() - y) < Y_TOLERANCE) {
+                    return line;
+                }
+            }
+            TableLine line = new TableLine(y);
+            lines.add(line);
+            return line;
+        }
     }
 
     /**
